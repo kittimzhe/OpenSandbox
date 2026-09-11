@@ -112,11 +112,19 @@ func buildCredential(uid, gid *uint32) (*syscall.Credential, error) {
 	// (even when every id matches), and setgroups requires CAP_SETGID no
 	// matter what values are requested — so same-identity credentials fail
 	// with "fork/exec ...: operation not permitted" inside sandboxes that
-	// drop capabilities (#1802).
+	// drop capabilities (#1802). The fast path applies only when the
+	// credential machinery would be a provable no-op: a uid-only request
+	// still resolves the user entry's primary GID and supplemental groups,
+	// so it skips the switch only when those match the daemon's own groups.
 	currentUID := uint32(os.Getuid())
 	currentGID := uint32(os.Getgid())
 	if (uid == nil || *uid == currentUID) && (gid == nil || *gid == currentGID) {
-		return nil, nil //nolint:nilnil
+		if gid != nil || uid == nil {
+			return nil, nil //nolint:nilnil
+		}
+		if sameProcessGroups(*uid) {
+			return nil, nil //nolint:nilnil
+		}
 	}
 
 	cred := &syscall.Credential{}
@@ -164,9 +172,42 @@ func credentialStartHint(err error, cred *syscall.Credential) error {
 		return err
 	}
 	return fmt.Errorf(
-		"%w (switching to uid=%d gid=%d requires CAP_SETUID/CAP_SETGID; the sandbox may have dropped capabilities — grant them or create the sandbox with bootstrap.execd.isolation=enable)",
+		"%w (switching to uid=%d gid=%d requires CAP_SETUID/CAP_SETGID, which this sandbox may not have — check the server's docker.drop_capabilities configuration; dropping these capabilities makes every identity switch fail)",
 		err, cred.Uid, cred.Gid,
 	)
+}
+
+// sameProcessGroups reports whether the given uid's user entry resolves to
+// the primary GID and supplemental groups the daemon already runs with, i.e.
+// whether building a credential for that uid would be a no-op group-wise.
+func sameProcessGroups(uid uint32) bool {
+	u, err := user.LookupId(strconv.FormatUint(uint64(uid), 10))
+	if err != nil {
+		return false
+	}
+	primaryGid, err := strconv.ParseUint(u.Gid, 10, 32)
+	if err != nil || uint32(primaryGid) != uint32(os.Getgid()) {
+		return false
+	}
+	entryGroups, err := u.GroupIds()
+	if err != nil {
+		return false
+	}
+	processGroups, err := syscall.Getgroups()
+	if err != nil || len(entryGroups) != len(processGroups) {
+		return false
+	}
+	seen := make(map[uint32]bool, len(processGroups))
+	for _, g := range processGroups {
+		seen[uint32(g)] = true
+	}
+	for _, g := range entryGroups {
+		id, err := strconv.ParseUint(g, 10, 32)
+		if err != nil || !seen[uint32(id)] {
+			return false
+		}
+	}
+	return true
 }
 
 // runCommand executes shell commands and streams their output.

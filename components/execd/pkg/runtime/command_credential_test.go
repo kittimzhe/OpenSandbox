@@ -45,13 +45,30 @@ func TestBuildCredential_SameIdentityReturnsNil(t *testing.T) {
 	require.NoError(t, err)
 	assert.Nil(t, cred, "explicit current uid+gid must not produce a credential")
 
-	cred, err = buildCredential(&uid, nil)
-	require.NoError(t, err)
-	assert.Nil(t, cred, "explicit current uid must not produce a credential")
-
 	cred, err = buildCredential(nil, &gid)
 	require.NoError(t, err)
 	assert.Nil(t, cred, "explicit current gid must not produce a credential")
+
+	// uid-only: the switch is skipped only when the user entry resolves to
+	// the daemon's own groups; otherwise the credential machinery still runs
+	// (the request asks for that user's primary GID and supplemental groups).
+	cred, err = buildCredential(&uid, nil)
+	require.NoError(t, err)
+	if sameProcessGroups(uid) {
+		assert.Nil(t, cred, "uid-only current identity with matching groups must not produce a credential")
+	} else {
+		require.NotNil(t, cred)
+		assert.Equal(t, uid, cred.Uid)
+	}
+}
+
+func TestSameProcessGroupsCurrentUID(t *testing.T) {
+	// The daemon's own uid must resolve to its own primary GID in any sane
+	// environment (root container: root/0/0; dev laptop: the logged-in user).
+	assert.True(t, sameProcessGroups(uint32(os.Getuid())))
+
+	// An unknown uid never matches.
+	assert.False(t, sameProcessGroups(4294967294))
 }
 
 func TestBuildCredential_IdentitySwitchBuildsCredential(t *testing.T) {
@@ -82,6 +99,7 @@ func TestCredentialStartHint(t *testing.T) {
 	hinted := credentialStartHint(permErr, cred)
 	require.ErrorIs(t, hinted, os.ErrPermission)
 	assert.Contains(t, hinted.Error(), "CAP_SETUID")
+	assert.Contains(t, hinted.Error(), "drop_capabilities")
 	assert.Contains(t, hinted.Error(), "uid=1000")
 
 	// EPERM without a credential switch: keep the raw error.
