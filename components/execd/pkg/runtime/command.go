@@ -106,6 +106,19 @@ func buildCredential(uid, gid *uint32) (*syscall.Credential, error) {
 		return nil, nil //nolint:nilnil
 	}
 
+	// An explicit uid/gid matching the identity execd already runs as needs
+	// no credential switch: return nil so the launch stays on the plain exec
+	// path. A non-nil Credential always makes the child call setgroups
+	// (even when every id matches), and setgroups requires CAP_SETGID no
+	// matter what values are requested — so same-identity credentials fail
+	// with "fork/exec ...: operation not permitted" inside sandboxes that
+	// drop capabilities (#1802).
+	currentUID := uint32(os.Getuid())
+	currentGID := uint32(os.Getgid())
+	if (uid == nil || *uid == currentUID) && (gid == nil || *gid == currentGID) {
+		return nil, nil //nolint:nilnil
+	}
+
 	cred := &syscall.Credential{}
 	if uid != nil {
 		cred.Uid = *uid
@@ -139,6 +152,21 @@ func buildCredential(uid, gid *uint32) (*syscall.Credential, error) {
 	}
 
 	return cred, nil
+}
+
+// credentialStartHint annotates command launch failures that happen while
+// switching identity. With capabilities dropped the kernel rejects the
+// child's setgroups/setgid/setuid calls, and the raw error surfaces as a
+// bare "fork/exec ...: operation not permitted" that gives the caller no
+// way to discover the missing grant (#1802).
+func credentialStartHint(err error, cred *syscall.Credential) error {
+	if cred == nil || !errors.Is(err, os.ErrPermission) {
+		return err
+	}
+	return fmt.Errorf(
+		"%w (switching to uid=%d gid=%d requires CAP_SETUID/CAP_SETGID; the sandbox may have dropped capabilities — grant them or create the sandbox with bootstrap.execd.isolation=enable)",
+		err, cred.Uid, cred.Gid,
+	)
 }
 
 // runCommand executes shell commands and streams their output.
@@ -196,13 +224,14 @@ func (c *Controller) runCommand(ctx context.Context, request *ExecuteCodeRequest
 	if err != nil {
 		close(done)
 		wg.Wait()
+		startErr := credentialStartHint(err, cred)
 		request.Hooks.OnExecuteInit(session)
 		request.Hooks.OnExecuteError(&execute.ErrorOutput{
 			EName:     "CommandExecError",
-			EValue:    err.Error(),
-			Traceback: []string{err.Error()},
+			EValue:    startErr.Error(),
+			Traceback: []string{startErr.Error()},
 		})
-		log.Error("CommandExecError: error starting commands: %v", err)
+		log.Error("CommandExecError: error starting commands: %v", startErr)
 		return nil
 	}
 
@@ -356,11 +385,12 @@ func (c *Controller) runBackgroundCommand(ctx context.Context, cancel context.Ca
 	}
 	if err != nil {
 		cancel()
-		log.Error("CommandExecError: error starting commands: %v", err)
+		startErr := credentialStartHint(err, cred)
+		log.Error("CommandExecError: error starting commands: %v", startErr)
 		kernel.running = false
 		c.storeCommandKernel(session, kernel)
-		c.markCommandFinished(session, 255, err.Error())
-		return fmt.Errorf("failed to start commands: %w", err)
+		c.markCommandFinished(session, 255, startErr.Error())
+		return fmt.Errorf("failed to start commands: %w", startErr)
 	}
 
 	// Register the kernel synchronously so that GetCommandStatus callers
