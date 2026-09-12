@@ -108,23 +108,9 @@ func buildCredential(uid, gid *uint32) (*syscall.Credential, error) {
 
 	// An explicit uid/gid matching the identity execd already runs as needs
 	// no credential switch: return nil so the launch stays on the plain exec
-	// path. A non-nil Credential always makes the child call setgroups
-	// (even when every id matches), and setgroups requires CAP_SETGID no
-	// matter what values are requested — so same-identity credentials fail
-	// with "fork/exec ...: operation not permitted" inside sandboxes that
-	// drop capabilities (#1802). The fast path applies only when the
-	// credential machinery would be a provable no-op: a uid-only request
-	// still resolves the user entry's primary GID and supplemental groups,
-	// so it skips the switch only when those match the daemon's own groups.
-	currentUID := uint32(os.Getuid())
-	currentGID := uint32(os.Getgid())
-	if (uid == nil || *uid == currentUID) && (gid == nil || *gid == currentGID) {
-		if gid != nil || uid == nil {
-			return nil, nil //nolint:nilnil
-		}
-		if sameProcessGroups(*uid) {
-			return nil, nil //nolint:nilnil
-		}
+	// path, which is also what the no-uid request already does (#1802).
+	if sameIdentityRequest(uid, gid) {
+		return nil, nil //nolint:nilnil
 	}
 
 	cred := &syscall.Credential{}
@@ -160,6 +146,26 @@ func buildCredential(uid, gid *uint32) (*syscall.Credential, error) {
 	}
 
 	return cred, nil
+}
+
+// sameIdentityRequest reports whether the requested uid/gid matches the
+// identity execd already runs with, making the credential machinery a
+// provable no-op. A non-nil Credential always makes the child call setgroups
+// (even when every id matches), and setgroups requires CAP_SETGID no matter
+// what values are requested — so same-identity credentials fail with
+// "fork/exec ...: operation not permitted" inside sandboxes that drop
+// capabilities (#1802). A uid-only request skips the switch only when the
+// user entry's primary GID and supplemental groups match the daemon's own.
+func sameIdentityRequest(uid, gid *uint32) bool {
+	currentUID := uint32(os.Getuid())
+	currentGID := uint32(os.Getgid())
+	if (uid == nil || *uid == currentUID) && (gid == nil || *gid == currentGID) {
+		if gid != nil || uid == nil {
+			return true
+		}
+		return sameProcessGroups(*uid)
+	}
+	return false
 }
 
 // credentialStartHint annotates command launch failures that happen while
