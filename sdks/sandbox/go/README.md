@@ -273,17 +273,20 @@ hits, err := sbx.SearchFiles(ctx, "/workspace", "*.json")
 info, err := sbx.GetFileInfo(ctx, "/workspace/app.py")
 
 // Directories, moves, permissions
-err = sbx.CreateDirectory(ctx, "/workspace/out", 0o755)
+// mode is octal digits packed into a decimal int: pass 755, or
+// opensandbox.OctalMode(0o755) when starting from a Go FileMode.
+err = sbx.CreateDirectory(ctx, "/workspace/out", 755)
 err = sbx.MoveFiles(ctx, opensandbox.MoveRequest{...})
 err = sbx.SetPermissions(ctx, opensandbox.PermissionsRequest{...})
 err = sbx.DeleteFiles(ctx, []string{"/workspace/tmp.log"})
 err = sbx.DeleteDirectory(ctx, "/workspace/out")
 
 // Text replacement across files
-err = sbx.ReplaceInFiles(ctx, opensandbox.ReplaceRequest{
+replaceReq := opensandbox.ReplaceRequest{
     "/workspace/config.yaml": {Old: "debug: true", New: "debug: false"},
-})
-detailed, err := sbx.ReplaceInFilesDetailed(ctx, req) // per-file ReplacedCount
+}
+err = sbx.ReplaceInFiles(ctx, replaceReq)
+detailed, err := sbx.ReplaceInFilesDetailed(ctx, replaceReq) // per-file ReplacedCount
 ```
 
 ### Mount volumes into a sandbox
@@ -325,13 +328,21 @@ tpl, err := mgr.CreateTemplate(ctx, opensandbox.CreateTemplateRequest{
         "cpu": "1", "memory": "512Mi", "disk": "2Gi",
     },
 })
-// Poll GetTemplate until tpl.Status is Succeeded, then:
-sandbox, err := opensandbox.CreateSandbox(ctx, config, opensandbox.SandboxCreateOptions{
-    TemplateID: tpl.ID,
-})
+// Poll GetTemplate until the build finishes. Status is a TemplateStatus
+// struct — compare its Phase field, not a string (bound the loop in real
+// code; a failed build never reaches Succeeded):
+for tpl.Status.Phase != opensandbox.TemplatePhaseSucceeded {
+    time.Sleep(10 * time.Second)
+    tpl, err = mgr.GetTemplate(ctx, tpl.TemplateID)
+}
 
-templates, err := mgr.ListTemplates(ctx, opensandbox.ListTemplatesOptions{})
-err = mgr.DeleteTemplate(ctx, tpl.ID)
+// Boot from the template: template-based creation requires an explicit
+// timeout — the server rejects creation without one.
+sandbox, err := opensandbox.CreateSandboxFromTemplate(ctx, config, tpl.TemplateID,
+    opensandbox.SandboxFromTemplateOptions{TimeoutSeconds: 3600})
+
+list, err := mgr.ListTemplates(ctx, opensandbox.ListTemplatesOptions{})
+err = mgr.DeleteTemplate(ctx, tpl.TemplateID)
 ```
 
 ### Wait for readiness with a custom health check
@@ -395,9 +406,9 @@ Created with `NewLifecycleClient(baseURL, apiKey string, opts ...Option)`.
 Created with `NewSandboxManager(config ConnectionConfig)`. Administrative
 operations on sandboxes without connecting to a specific one; every method is a
 thin wrapper over the corresponding `LifecycleClient` call (see table above),
-plus `Close()`. Manager operations act across sandboxes by ID
-(the quick-start snapshot example is one of these); call `Close()` when done
-to release resources.
+plus `Close()` (a no-op kept for symmetry — it does not terminate
+sandboxes). Manager operations act across sandboxes by ID (the quick-start
+snapshot example is one of these).
 
 **Snapshots:**
 | Method | Description |
@@ -425,7 +436,7 @@ to release resources.
 | `ResumeSandbox(ctx, sandboxID)` | Resume a paused sandbox |
 | `KillSandbox(ctx, sandboxID)` | Force-terminate a sandbox |
 | `RenewSandbox(ctx, sandboxID, duration)` | Extend a sandbox's expiration |
-| `Close()` | Release manager resources |
+| `Close()` | No-op; does not terminate sandboxes |
 
 
 ### ExecdClient
@@ -522,7 +533,7 @@ wrap the underlying clients with the sandbox's own credentials:
 | `PatchMetadata(ctx, patch)` | Patch metadata |
 | `SetEnv(ctx, key, value)` | Set an environment variable inside the sandbox |
 | `Kill(ctx)` | Force-terminate |
-| `Close()` | Release sandbox resources |
+| `Close()` | No-op; does not terminate the sandbox |
 | `CreateSnapshot(ctx, req)` | Create a snapshot of this sandbox |
 
 File operations, command execution, code execution, and isolated sessions are
