@@ -250,21 +250,36 @@ File helpers live on `Sandbox` (they wrap the `ExecdClient` file operations
 with the sandbox's own access token):
 
 ```go
-// Upload (single or multipart-batch)
-err := sbx.UploadFile(ctx, bytes.NewReader(data), opensandbox.UploadFileOptions{
-    FileName: "app.py",
-})
-err = sbx.UploadFiles(ctx, []opensandbox.UploadFileEntry{
-    {File: f1, Options: opensandbox.UploadFileOptions{FileName: "a.txt"}},
-    {File: f2, Options: opensandbox.UploadFileOptions{FileName: "b.txt"}},
+// The examples below need a live handle; the quick start above left `sbx`
+// as a *SandboxInfo, which has no file methods.
+sbx, err := opensandbox.CreateSandbox(ctx, config, opensandbox.SandboxCreateOptions{
+    Image: "python:3.11",
 })
 
-// Download: full file, byte-range, or line-based
-body, err := sbx.DownloadFile(ctx, "/var/log/app.log", "")           // full
-body, err = sbx.DownloadFile(ctx, "/var/log/app.log", "bytes=0-1023") // partial
-body, err = sbx.DownloadFile(ctx, "/var/log/app.log", "",
-    opensandbox.DownloadFileOptions{Offset: 10, Limit: 50})        // lines 10-59
-defer body.Close()
+// Upload (single or multipart-batch). Metadata.Path is the destination and
+// is required — FileName alone is just the multipart filename.
+err = sbx.UploadFile(ctx, bytes.NewReader(data), opensandbox.UploadFileOptions{
+    FileName: "app.py",
+    Metadata: opensandbox.FileMetadata{Path: "/workspace/app.py"},
+})
+err = sbx.UploadFiles(ctx, []opensandbox.UploadFileEntry{
+    {File: f1, Options: opensandbox.UploadFileOptions{
+        FileName: "a.txt", Metadata: opensandbox.FileMetadata{Path: "/workspace/a.txt"},
+    }},
+    {File: f2, Options: opensandbox.UploadFileOptions{
+        FileName: "b.txt", Metadata: opensandbox.FileMetadata{Path: "/workspace/b.txt"},
+    }},
+})
+
+// Download: full file, byte-range, or line-based. Each call returns its
+// own reader — close each one (a single shared defer would leak the first two).
+full, err := sbx.DownloadFile(ctx, "/var/log/app.log", "") // full
+defer full.Close()
+partial, err := sbx.DownloadFile(ctx, "/var/log/app.log", "bytes=0-1023") // partial
+defer partial.Close()
+lines, err := sbx.DownloadFile(ctx, "/var/log/app.log", "",
+    opensandbox.DownloadFileOptions{Offset: 10, Limit: 50}) // lines 10-59
+defer lines.Close()
 
 // List, inspect, search
 entries, err := sbx.ListDirectory(ctx, "/workspace")
@@ -523,12 +538,15 @@ wrap the underlying clients with the sandbox's own credentials:
 | Method | Description |
 |--------|-------------|
 | `ID()` | The sandbox ID |
+| `Origin()` | Origin reported by the server: `SandboxOriginTemplate`, or `SandboxOriginUnknown` |
+| `GetInfo(ctx)` | Fetch the current `SandboxInfo` |
 | `WaitUntilReady(ctx, opts)` | Poll until ready (execd `/ping` by default; custom `ReadyOptions.HealthCheck` replaces it) |
 | `IsHealthy(ctx)` | One-shot health check |
 | `Ping(ctx)` | Ping execd |
 | `GetEndpoint(ctx, port)` | Get a public endpoint for a sandbox port |
 | `GetSignedEndpoint(ctx, port, expires)` | Get a signed endpoint URL with OSEP-0011 route token |
-| `Pause(ctx)` / `Resume(ctx)` | Pause / resume this sandbox |
+| `Pause(ctx)` | Pause this sandbox |
+| `Resume(ctx)` | Resume and return a newly connected handle (not in-place) |
 | `Renew(ctx, duration)` | Extend expiration |
 | `PatchMetadata(ctx, patch)` | Patch metadata |
 | `SetEnv(ctx, key, value)` | Set an environment variable inside the sandbox |
