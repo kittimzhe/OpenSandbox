@@ -238,3 +238,10 @@ func GetFileInfo(filePath string) (model.FileInfo, error) {
 
 	return buildFileInfo(absPath, fileInfo)
 }
+
+// uploadOwnerOf reports the uid/gid an atomic upload must preserve when it
+// replaces an existing destination. Windows has no chown semantics for
+// renames, so uploads there never carry ownership over.
+func uploadOwnerOf(fi os.FileInfo) (int, int) {
+	return -1, -1
+}

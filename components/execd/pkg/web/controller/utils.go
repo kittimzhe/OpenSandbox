@@ -274,3 +274,12 @@ func GetFileInfo(filePath string) (model.FileInfo, error) {
 
 	return buildFileInfo(absPath, fileInfo)
 }
+
+// uploadOwnerOf reports the uid/gid an atomic upload must preserve when it
+// replaces an existing destination. -1/-1 leaves the staged file as-is.
+func uploadOwnerOf(fi os.FileInfo) (int, int) {
+	if stat, ok := fi.Sys().(*syscall.Stat_t); ok {
+		return int(stat.Uid), int(stat.Gid)
+	}
+	return -1, -1
+}

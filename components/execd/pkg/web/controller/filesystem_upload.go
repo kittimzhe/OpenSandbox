@@ -16,6 +16,7 @@ package controller
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime/multipart"
@@ -173,35 +174,116 @@ func writeUploadFile(resolvedPath string, fileHeader *multipart.FileHeader) *upl
 	}
 	defer file.Close()
 
-	dst, err := os.OpenFile(resolvedPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, os.ModePerm)
-	if err != nil {
+	return writeUploadStream(resolvedPath, file)
+}
+
+// writeUploadStream stores an upload atomically: the bytes are staged in a
+// temp file inside the destination directory and renamed over the destination
+// only after every byte is written and synced. Any failure before that point -
+// a broken request stream, ENOSPC, an I/O error, execd dying mid-copy - leaves
+// the destination exactly as it was. The previous open(O_TRUNC)-then-copy
+// design truncated the destination up front, turning a failed upload into
+// unrecoverable data loss (#2432).
+func writeUploadStream(resolvedPath string, src io.Reader) *uploadError {
+	dest := followUploadSymlink(resolvedPath)
+
+	// Reject what the in-place write rejected (a directory, a special file,
+	// a destination this process cannot open for writing) before staging
+	// anything: a rename would otherwise happily replace a destination the
+	// old code could not even open. The probe carries no O_TRUNC, so it
+	// cannot damage the destination.
+	if fi, err := os.Lstat(dest); err == nil && !fi.Mode().IsRegular() {
+		return newUploadError(
+			http.StatusInternalServerError,
+			model.ErrorCodeRuntimeError,
+			fmt.Sprintf("destination %s is not a regular file", resolvedPath),
+		)
+	}
+	probe, err := os.OpenFile(dest, os.O_WRONLY, 0)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return newUploadError(
 			http.StatusInternalServerError,
 			model.ErrorCodeRuntimeError,
 			fmt.Sprintf("error opening destination file %s. %v", resolvedPath, err),
 		)
 	}
+	if err == nil {
+		probe.Close()
+	}
 
-	if _, err := io.Copy(dst, file); err != nil {
-		dst.Close()
+	// Keep what an in-place write preserved for free: the destination's
+	// mode, and on Unix its owner and group. New destinations are staged
+	// with the same mode the old O_CREATE used.
+	mode := os.ModePerm
+	uid, gid := -1, -1
+	if fi, err := os.Stat(dest); err == nil {
+		mode = fi.Mode().Perm()
+		uid, gid = uploadOwnerOf(fi)
+	}
+
+	targetDir := filepath.Dir(dest)
+	staged, err := os.CreateTemp(targetDir, ".upload-*.tmp")
+	if err != nil {
+		return newUploadError(
+			http.StatusInternalServerError,
+			model.ErrorCodeRuntimeError,
+			fmt.Sprintf("error creating staging file for %s. %v", resolvedPath, err),
+		)
+	}
+	stagedName := staged.Name()
+	defer os.Remove(stagedName) // no-op once renamed into place
+
+	if err := os.Chmod(stagedName, mode); err != nil {
+		staged.Close()
+		return newUploadError(
+			http.StatusInternalServerError,
+			model.ErrorCodeRuntimeError,
+			fmt.Sprintf("error chmoding staging file for %s. %v", resolvedPath, err),
+		)
+	}
+	if uid >= 0 || gid >= 0 {
+		// Best-effort like the directory sync below: a non-root execd
+		// cannot chown, and the metadata permission pass after the rename
+		// re-asserts ownership from the request anyway.
+		if err := os.Chown(stagedName, uid, gid); err != nil {
+			log.Warn("upload: chown staging file %s: %v", stagedName, err)
+		}
+	}
+
+	if _, err := io.Copy(staged, src); err != nil {
+		staged.Close()
 		return newUploadError(
 			http.StatusInternalServerError,
 			model.ErrorCodeRuntimeError,
 			fmt.Sprintf("error copying file %s. %v", resolvedPath, err),
 		)
 	}
-
-	if err := dst.Sync(); err != nil {
-		log.Error("upload: sync target file: %v", err)
+	if err := staged.Sync(); err != nil {
+		staged.Close()
+		return newUploadError(
+			http.StatusInternalServerError,
+			model.ErrorCodeRuntimeError,
+			fmt.Sprintf("error syncing staging file for %s. %v", resolvedPath, err),
+		)
 	}
-	if err := dst.Close(); err != nil {
-		log.Error("upload: close target file: %v", err)
+	if err := staged.Close(); err != nil {
+		return newUploadError(
+			http.StatusInternalServerError,
+			model.ErrorCodeRuntimeError,
+			fmt.Sprintf("error closing staging file for %s. %v", resolvedPath, err),
+		)
+	}
+	if err := os.Rename(stagedName, dest); err != nil {
+		return newUploadError(
+			http.StatusInternalServerError,
+			model.ErrorCodeRuntimeError,
+			fmt.Sprintf("error replacing destination file %s. %v", resolvedPath, err),
+		)
 	}
 
-	// fsync parent directory so the new dirent is durable and visible on
+	// fsync parent directory so the rename is durable and visible on
 	// weakly-coherent filesystems (virtio-fs, 9pfs, etc.). Best-effort:
 	// some filesystems return ENOTSUP for directory fsync.
-	targetDir := filepath.Dir(resolvedPath)
 	if d, err := os.Open(targetDir); err == nil {
 		if err := d.Sync(); err != nil {
 			log.Warn("upload: sync parent dir %s: %v", targetDir, err)
@@ -209,6 +291,30 @@ func writeUploadFile(resolvedPath string, fileHeader *multipart.FileHeader) *upl
 		_ = d.Close()
 	}
 	return nil
+}
+
+// followUploadSymlink resolves a symlink in the final path component the way
+// the previous in-place open did: an upload through `link -> real` must
+// replace `real`, not the link itself, and a dangling link must create its
+// (still missing) target rather than overwriting the link. Symlinks in parent
+// components are followed by the kernel for open and rename alike, so only
+// the final component is walked here.
+func followUploadSymlink(path string) string {
+	for i := 0; i < 40; i++ {
+		fi, err := os.Lstat(path)
+		if err != nil || fi.Mode()&os.ModeSymlink == 0 {
+			return path
+		}
+		dest, err := os.Readlink(path)
+		if err != nil {
+			return path
+		}
+		if !filepath.IsAbs(dest) {
+			dest = filepath.Join(filepath.Dir(path), dest)
+		}
+		path = dest
+	}
+	return path
 }
 
 // applyUploadPermission applies the metadata permission with one retry to
