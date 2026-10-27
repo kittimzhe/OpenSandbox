@@ -164,6 +164,41 @@ func TestWriteUploadStreamDanglingSymlinkCreatesTarget(t *testing.T) {
 	}
 }
 
+// A relative symlink target must resolve against the physical directory
+// that contains the link, not the lexical parent of the requested path.
+// Uploading <root>/dir/file where dir -> a/b and file -> ../target.md must
+// update <root>/a/target.md and must not touch <root>/target.md.
+func TestWriteUploadStreamResolvesRelativeTargetThroughSymlinkedParent(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "a", "b"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "a", "target.md"), []byte("original\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("../target.md", filepath.Join(root, "a", "b", "file")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("a/b", filepath.Join(root, "dir")); err != nil {
+		t.Fatal(err)
+	}
+
+	if uerr := writeUploadStream(filepath.Join(root, "dir", "file"), strings.NewReader("resolved physically\n")); uerr != nil {
+		t.Fatalf("unexpected upload error: %v", uerr.message)
+	}
+
+	got, err := os.ReadFile(filepath.Join(root, "a", "target.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "resolved physically\n" {
+		t.Fatalf("physical target not updated: want %q, got %q", "resolved physically\n", string(got))
+	}
+	if _, err := os.Lstat(filepath.Join(root, "target.md")); !os.IsNotExist(err) {
+		t.Fatalf("lexical sibling was created or clobbered: %v", err)
+	}
+}
+
 // A directory destination keeps being rejected instead of being renamed over.
 func TestWriteUploadStreamRejectsDirectory(t *testing.T) {
 	dir := t.TempDir()

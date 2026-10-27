@@ -15,6 +15,8 @@
 package controller
 
 import (
+	crand "crypto/rand"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -212,18 +214,36 @@ func writeUploadStream(resolvedPath string, src io.Reader) *uploadError {
 	}
 
 	// Keep what an in-place write preserved for free: the destination's
-	// mode, and on Unix its owner and group. New destinations are staged
-	// with the same mode the old O_CREATE used.
+	// mode, and on Unix its owner and group.
+	existing := false
 	mode := os.ModePerm
 	uid, gid := -1, -1
 	if fi, err := os.Stat(dest); err == nil {
+		existing = true
 		mode = fi.Mode().Perm()
 		uid, gid = uploadOwnerOf(fi)
 	}
 
 	targetDir := filepath.Dir(dest)
-	staged, err := os.CreateTemp(targetDir, ".upload-*.tmp")
+
+	// The staging file's creation mode is what the kernel umask shapes, so
+	// a new destination gets exactly the bits the old O_CREATE produced.
+	// Replacing a destination stages 0600 and chmods the exact previous
+	// mode on top afterwards, because chmod is not umask-filtered.
+	stagedMode := os.ModePerm
+	if existing {
+		stagedMode = 0o600
+	}
+	staged, err := openStaging(targetDir, stagedMode)
 	if err != nil {
+		if existing && errors.Is(err, os.ErrPermission) {
+			// The parent directory is not writable, but the destination
+			// itself is (the probe above passed) - a 0666-file-under-0555
+			// layout the in-place write always served. No atomic path
+			// exists there, so keep serving it with the historical
+			// in-place write instead of failing the upload.
+			return copyInPlace(dest, src, resolvedPath)
+		}
 		return newUploadError(
 			http.StatusInternalServerError,
 			model.ErrorCodeRuntimeError,
@@ -231,22 +251,21 @@ func writeUploadStream(resolvedPath string, src io.Reader) *uploadError {
 		)
 	}
 	stagedName := staged.Name()
-	defer os.Remove(stagedName) // no-op once renamed into place
+	keepStaging := false
+	defer func() {
+		if !keepStaging {
+			os.Remove(stagedName)
+		}
+	}()
 
-	if err := os.Chmod(stagedName, mode); err != nil {
-		staged.Close()
-		return newUploadError(
-			http.StatusInternalServerError,
-			model.ErrorCodeRuntimeError,
-			fmt.Sprintf("error chmoding staging file for %s. %v", resolvedPath, err),
-		)
-	}
-	if uid >= 0 || gid >= 0 {
-		// Best-effort like the directory sync below: a non-root execd
-		// cannot chown, and the metadata permission pass after the rename
-		// re-asserts ownership from the request anyway.
-		if err := os.Chown(stagedName, uid, gid); err != nil {
-			log.Warn("upload: chown staging file %s: %v", stagedName, err)
+	if existing {
+		if err := os.Chmod(stagedName, mode); err != nil {
+			staged.Close()
+			return newUploadError(
+				http.StatusInternalServerError,
+				model.ErrorCodeRuntimeError,
+				fmt.Sprintf("error chmoding staging file for %s. %v", resolvedPath, err),
+			)
 		}
 	}
 
@@ -273,6 +292,28 @@ func writeUploadStream(resolvedPath string, src io.Reader) *uploadError {
 			fmt.Sprintf("error closing staging file for %s. %v", resolvedPath, err),
 		)
 	}
+
+	if existing && (uid >= 0 || gid >= 0) {
+		if err := os.Chown(stagedName, uid, gid); err != nil {
+			if !errors.Is(err, os.ErrPermission) {
+				return newUploadError(
+					http.StatusInternalServerError,
+					model.ErrorCodeRuntimeError,
+					fmt.Sprintf("error chowning staging file for %s. %v", resolvedPath, err),
+				)
+			}
+			// Non-root execd cannot re-own the staging file to the
+			// destination's owner, and a rename would silently hand the
+			// destination to execd's own user - ownership the in-place
+			// write preserved for free. The staged bytes are complete and
+			// synced by now, so write them into the destination in place
+			// instead; if even that fails, the staging file is kept and
+			// named in the error so the upload's contents survive.
+			keepStaging = true
+			return replaceFromStaging(stagedName, dest, resolvedPath, &keepStaging)
+		}
+	}
+
 	if err := os.Rename(stagedName, dest); err != nil {
 		return newUploadError(
 			http.StatusInternalServerError,
@@ -293,12 +334,104 @@ func writeUploadStream(resolvedPath string, src io.Reader) *uploadError {
 	return nil
 }
 
+// openStaging creates a unique dot-prefixed staging file in dir with the
+// given creation mode, so the process umask applies to it exactly as it did
+// to the destination file the old O_CREATE path produced.
+func openStaging(dir string, mode os.FileMode) (*os.File, error) {
+	var seed [4]byte
+	for i := 0; i < 10000; i++ {
+		if _, err := crand.Read(seed[:]); err != nil {
+			return nil, err
+		}
+		name := filepath.Join(dir, fmt.Sprintf(".upload-%08x.tmp", binary.BigEndian.Uint32(seed[:])))
+		f, err := os.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode)
+		if errors.Is(err, os.ErrExist) {
+			continue
+		}
+		return f, err
+	}
+	return nil, os.ErrExist
+}
+
+// copyInPlace is the historical write algorithm, used only where no atomic
+// path exists: a writable destination under an unwritable parent directory,
+// and a foreign-owned destination a non-root execd cannot re-own its staging
+// file to. Those corners always wrote in place, and failing uploads that
+// always worked would be a regression, so they keep the old semantics.
+func copyInPlace(dest string, src io.Reader, resolvedPath string) *uploadError {
+	dst, err := os.OpenFile(dest, os.O_WRONLY|os.O_TRUNC, 0)
+	if err != nil {
+		return newUploadError(
+			http.StatusInternalServerError,
+			model.ErrorCodeRuntimeError,
+			fmt.Sprintf("error opening destination file %s. %v", resolvedPath, err),
+		)
+	}
+	if _, err := io.Copy(dst, src); err != nil {
+		dst.Close()
+		return newUploadError(
+			http.StatusInternalServerError,
+			model.ErrorCodeRuntimeError,
+			fmt.Sprintf("error copying file %s. %v", resolvedPath, err),
+		)
+	}
+	if err := dst.Sync(); err != nil {
+		dst.Close()
+		return newUploadError(
+			http.StatusInternalServerError,
+			model.ErrorCodeRuntimeError,
+			fmt.Sprintf("error syncing destination file %s. %v", resolvedPath, err),
+		)
+	}
+	if err := dst.Close(); err != nil {
+		return newUploadError(
+			http.StatusInternalServerError,
+			model.ErrorCodeRuntimeError,
+			fmt.Sprintf("error closing destination file %s. %v", resolvedPath, err),
+		)
+	}
+	return nil
+}
+
+// replaceFromStaging streams a fully staged upload into the existing
+// destination in place (see copyInPlace). On failure the staging file is
+// kept and its path is surfaced in the error, so the complete uploaded
+// contents survive for manual recovery instead of being deleted.
+func replaceFromStaging(stagedName, dest, resolvedPath string, keepStaging *bool) *uploadError {
+	f, err := os.Open(stagedName)
+	if err != nil {
+		return newUploadError(
+			http.StatusInternalServerError,
+			model.ErrorCodeRuntimeError,
+			fmt.Sprintf("error reopening staging file %s. %v", stagedName, err),
+		)
+	}
+	defer f.Close()
+
+	if uerr := copyInPlace(dest, f, resolvedPath); uerr != nil {
+		return newUploadError(
+			http.StatusInternalServerError,
+			model.ErrorCodeRuntimeError,
+			fmt.Sprintf(
+				"error replacing file %s in place: %v; the complete uploaded contents are preserved at %s",
+				resolvedPath, uerr.message, stagedName,
+			),
+		)
+	}
+	*keepStaging = false
+	return nil
+}
+
 // followUploadSymlink resolves a symlink in the final path component the way
 // the previous in-place open did: an upload through `link -> real` must
 // replace `real`, not the link itself, and a dangling link must create its
-// (still missing) target rather than overwriting the link. Symlinks in parent
-// components are followed by the kernel for open and rename alike, so only
-// the final component is walked here.
+// (still missing) target rather than overwriting the link. A relative link
+// target is joined onto the physical directory that contains the link -
+// resolved with EvalSymlinks - never onto the lexical one, so `..` segments
+// and symlinked parents resolve the way the kernel would have.
+// Symlinks in parent components of the requested path itself are followed by
+// the kernel for open and rename alike, so only the final component is
+// walked here.
 func followUploadSymlink(path string) string {
 	for i := 0; i < 40; i++ {
 		fi, err := os.Lstat(path)
@@ -309,8 +442,12 @@ func followUploadSymlink(path string) string {
 		if err != nil {
 			return path
 		}
+		dir, err := filepath.EvalSymlinks(filepath.Dir(path))
+		if err != nil {
+			dir = filepath.Dir(path)
+		}
 		if !filepath.IsAbs(dest) {
-			dest = filepath.Join(filepath.Dir(path), dest)
+			dest = filepath.Join(dir, dest)
 		}
 		path = dest
 	}
