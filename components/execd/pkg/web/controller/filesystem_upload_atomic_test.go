@@ -211,7 +211,7 @@ func TestWriteUploadStreamRejectsDirectory(t *testing.T) {
 	if uerr == nil {
 		t.Fatal("expected an upload error")
 	}
-	if !strings.Contains(uerr.message, "not a regular file") {
+	if !strings.Contains(uerr.message, "is a directory") {
 		t.Fatalf("unexpected error message: %q", uerr.message)
 	}
 	if fi, err := os.Lstat(dest); err != nil || !fi.IsDir() {
@@ -243,5 +243,39 @@ func TestWriteUploadStreamRejectsReadOnlyDestination(t *testing.T) {
 	}
 	if string(got) != "previous content\n" {
 		t.Fatalf("read-only destination was replaced: got %q", string(got))
+	}
+}
+
+// A destination rename(2) refuses to replace - a writable single-file bind
+// mount answers EBUSY/EXDEV - still receives the upload, published in place
+// from the staged copy, exactly as the old O_TRUNC write served it.
+func TestWriteUploadStreamFallsBackWhenRenameRefuses(t *testing.T) {
+	dir := t.TempDir()
+	dest := filepath.Join(dir, "mounted.md")
+	if err := os.WriteFile(dest, []byte("old contents\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	restore := renameUpload
+	renameUpload = func(oldpath, newpath string) error { return errors.New("simulated EBUSY") }
+	t.Cleanup(func() { renameUpload = restore })
+
+	if uerr := writeUploadStream(dest, strings.NewReader("mounted destination contents\n")); uerr != nil {
+		t.Fatalf("upload through an unrenamable destination failed: %v", uerr.message)
+	}
+
+	got, err := os.ReadFile(dest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "mounted destination contents\n" {
+		t.Fatalf("destination not updated: %q", string(got))
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("staging leftovers after the in-place publish: %v", entries)
 	}
 }

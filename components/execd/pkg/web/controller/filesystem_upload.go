@@ -189,39 +189,47 @@ func writeUploadFile(resolvedPath string, fileHeader *multipart.FileHeader) *upl
 func writeUploadStream(resolvedPath string, src io.Reader) *uploadError {
 	dest := followUploadSymlink(resolvedPath)
 
-	// Reject what the in-place write rejected (a directory, a special file,
-	// a destination this process cannot open for writing) before staging
-	// anything: a rename would otherwise happily replace a destination the
-	// old code could not even open. The probe carries no O_TRUNC, so it
-	// cannot damage the destination.
-	if fi, err := os.Lstat(dest); err == nil && !fi.Mode().IsRegular() {
-		return newUploadError(
-			http.StatusInternalServerError,
-			model.ErrorCodeRuntimeError,
-			fmt.Sprintf("destination %s is not a regular file", resolvedPath),
-		)
+	// Classify the destination once. A directory keeps being refused, and a
+	// special file (device, FIFO, socket) was never replaceable by a rename
+	// and was always streamed into in place, so it keeps that path.
+	destInfo, statErr := os.Lstat(dest)
+	existing := statErr == nil
+	if existing {
+		if destInfo.IsDir() {
+			return newUploadError(
+				http.StatusInternalServerError,
+				model.ErrorCodeRuntimeError,
+				fmt.Sprintf("destination %s is a directory", resolvedPath),
+			)
+		}
+		if !destInfo.Mode().IsRegular() {
+			return copyInPlace(dest, src, resolvedPath, os.ModePerm)
+		}
 	}
-	probe, err := os.OpenFile(dest, os.O_WRONLY, 0)
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return newUploadError(
-			http.StatusInternalServerError,
-			model.ErrorCodeRuntimeError,
-			fmt.Sprintf("error opening destination file %s. %v", resolvedPath, err),
-		)
-	}
-	if err == nil {
+
+	// Reject a destination this process cannot open for writing before
+	// staging anything: a rename would otherwise replace a file the old code
+	// could not even open. The probe carries no O_TRUNC, so it cannot damage
+	// the destination.
+	if existing {
+		probe, err := os.OpenFile(dest, os.O_WRONLY, 0)
+		if err != nil {
+			return newUploadError(
+				http.StatusInternalServerError,
+				model.ErrorCodeRuntimeError,
+				fmt.Sprintf("error opening destination file %s. %v", resolvedPath, err),
+			)
+		}
 		probe.Close()
 	}
 
 	// Keep what an in-place write preserved for free: the destination's
 	// mode, and on Unix its owner and group.
-	existing := false
 	mode := os.ModePerm
 	uid, gid := -1, -1
-	if fi, err := os.Stat(dest); err == nil {
-		existing = true
-		mode = fi.Mode().Perm()
-		uid, gid = uploadOwnerOf(fi)
+	if existing {
+		mode = destInfo.Mode().Perm()
+		uid, gid = uploadOwnerOf(destInfo)
 	}
 
 	targetDir := filepath.Dir(dest)
@@ -242,7 +250,7 @@ func writeUploadStream(resolvedPath string, src io.Reader) *uploadError {
 			// layout the in-place write always served. No atomic path
 			// exists there, so keep serving it with the historical
 			// in-place write instead of failing the upload.
-			return copyInPlace(dest, src, resolvedPath)
+			return copyInPlace(dest, src, resolvedPath, mode)
 		}
 		return newUploadError(
 			http.StatusInternalServerError,
@@ -314,15 +322,11 @@ func writeUploadStream(resolvedPath string, src io.Reader) *uploadError {
 		}
 	}
 
-	if err := os.Rename(stagedName, dest); err != nil {
-		return newUploadError(
-			http.StatusInternalServerError,
-			model.ErrorCodeRuntimeError,
-			fmt.Sprintf("error replacing destination file %s. %v", resolvedPath, err),
-		)
+	if err := publishStagedUpload(stagedName, dest, resolvedPath, destInfo, existing, &keepStaging); err != nil {
+		return err
 	}
 
-	// fsync parent directory so the rename is durable and visible on
+	// fsync parent directory so the publish is durable and visible on
 	// weakly-coherent filesystems (virtio-fs, 9pfs, etc.). Best-effort:
 	// some filesystems return ENOTSUP for directory fsync.
 	if d, err := os.Open(targetDir); err == nil {
@@ -330,6 +334,47 @@ func writeUploadStream(resolvedPath string, src io.Reader) *uploadError {
 			log.Warn("upload: sync parent dir %s: %v", targetDir, err)
 		}
 		_ = d.Close()
+	}
+	return nil
+}
+
+// renameUpload exists so tests can inject the rename failures real
+// destinations produce: a writable single-file bind mount answers EBUSY/EXDEV
+// to rename(2) while the old in-place write served it.
+var renameUpload = os.Rename
+
+// publishStagedUpload makes a fully written, synced staging file the
+// destination. It prefers rename(2), which is atomic and never leaves the
+// destination partial, and routes to an in-place publish from the staging
+// file wherever a rename would change what the destination *is* - the cases
+// an inode swap cannot reproduce:
+//
+//   - hard links: a rename repoints one directory entry, so every other name
+//     of the inode would keep the old bytes, which the old O_TRUNC write kept
+//     in sync;
+//   - extended attributes, including the POSIX access ACL: a new inode starts
+//     without them, which for an ACL can silently widen access. They are
+//     copied onto the staging file first, and a set that the process cannot
+//     reproduce (security.* needs privilege) falls back to in place;
+//   - destinations rename(2) refuses to replace at all: a writable
+//     single-file bind mount is a mount point and answers EBUSY/EXDEV.
+func publishStagedUpload(
+	stagedName, dest, resolvedPath string,
+	destInfo os.FileInfo,
+	existing bool,
+	keepStaging *bool,
+) *uploadError {
+	if existing {
+		if uploadLinkCount(destInfo) > 1 {
+			return replaceFromStaging(stagedName, dest, resolvedPath, keepStaging)
+		}
+		if !copyUploadAttrs(dest, stagedName) {
+			return replaceFromStaging(stagedName, dest, resolvedPath, keepStaging)
+		}
+	}
+
+	if err := renameUpload(stagedName, dest); err != nil {
+		return replaceFromStaging(stagedName, dest, resolvedPath, keepStaging)
 	}
 	return nil
 }
@@ -353,13 +398,15 @@ func openStaging(dir string, mode os.FileMode) (*os.File, error) {
 	return nil, os.ErrExist
 }
 
-// copyInPlace is the historical write algorithm, used only where no atomic
-// path exists: a writable destination under an unwritable parent directory,
-// and a foreign-owned destination a non-root execd cannot re-own its staging
-// file to. Those corners always wrote in place, and failing uploads that
-// always worked would be a regression, so they keep the old semantics.
-func copyInPlace(dest string, src io.Reader, resolvedPath string) *uploadError {
-	dst, err := os.OpenFile(dest, os.O_WRONLY|os.O_TRUNC, 0)
+// copyInPlace is the historical write algorithm, used only where publishing a
+// new inode would change what the destination is: special files, hard-linked
+// aliases, attributes the staging file cannot carry, a writable destination
+// under an unwritable parent directory, a foreign-owned destination a non-root
+// execd cannot re-own its staging file to, and destinations rename(2) refuses
+// (mount points such as single-file bind mounts). Those corners always wrote
+// in place, and failing uploads that always worked would be a regression.
+func copyInPlace(dest string, src io.Reader, resolvedPath string, createMode os.FileMode) *uploadError {
+	dst, err := os.OpenFile(dest, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, createMode)
 	if err != nil {
 		return newUploadError(
 			http.StatusInternalServerError,
@@ -376,12 +423,18 @@ func copyInPlace(dest string, src io.Reader, resolvedPath string) *uploadError {
 		)
 	}
 	if err := dst.Sync(); err != nil {
-		dst.Close()
-		return newUploadError(
-			http.StatusInternalServerError,
-			model.ErrorCodeRuntimeError,
-			fmt.Sprintf("error syncing destination file %s. %v", resolvedPath, err),
-		)
+		// A device or FIFO answers EINVAL/ENOTSUP to fsync, and the
+		// historical write only logged that, so a special destination keeps
+		// working; a regular file still reports the failure.
+		if fi, statErr := dst.Stat(); statErr == nil && fi.Mode().IsRegular() {
+			dst.Close()
+			return newUploadError(
+				http.StatusInternalServerError,
+				model.ErrorCodeRuntimeError,
+				fmt.Sprintf("error syncing destination file %s. %v", resolvedPath, err),
+			)
+		}
+		log.Warn("upload: sync destination %s: %v", resolvedPath, err)
 	}
 	if err := dst.Close(); err != nil {
 		return newUploadError(
@@ -408,7 +461,7 @@ func replaceFromStaging(stagedName, dest, resolvedPath string, keepStaging *bool
 	}
 	defer f.Close()
 
-	if uerr := copyInPlace(dest, f, resolvedPath); uerr != nil {
+	if uerr := copyInPlace(dest, f, resolvedPath, os.ModePerm); uerr != nil {
 		return newUploadError(
 			http.StatusInternalServerError,
 			model.ErrorCodeRuntimeError,
